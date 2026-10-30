@@ -3,3 +3,5 @@
 # Downloaded data, can be re-created with: python3 fetch.py --refresh
 cache.json
 __pycache__/
+# macOS folder files
+.DS_Store
