@@ -1,61 +1,123 @@
-# health.py - One 0-100 health score for a repo, built from metrics.py.
-# Rule-based: every number used is a named constant below, so it's easy to explain.
-# Usage: python3 health.py
+"""
+health.py — owned by Nishanth (backend)
 
-import sys
+Converts the four metrics into a single 0–100 health score and a
+traffic-light grade (A / B / C / D / F).
 
-from cache_file import cache_exists, load_cache
-from health_helpers import newcomer_long_wait_share, share_points, sliding_points, unanswered_share
-from metrics import median_first_response, median_review_wait
+Formula weights:
+  First response time  : 30 %
+  PR review wait       : 30 %
+  Newcomer retention   : 25 %
+  Contributor funnel   : 15 %
 
-RESPONSE_POINTS = 30        # most points for a fast first human reply
-RESPONSE_FULL_HOURS = 24    # median at or under this gets full marks
-RESPONSE_ZERO_HOURS = 168   # median at or over this (7 days) gets 0
-REVIEW_POINTS = 20          # most points for a fast first human PR review
-REVIEW_FULL_HOURS = 48
-REVIEW_ZERO_HOURS = 336     # 14 days
-NEWCOMER_POINTS = 25        # most points for not leaving newcomers waiting
-NEWCOMER_WAIT_HOURS = 168   # a newcomer item waiting longer than this (7 days) counts against us
-UNANSWERED_POINTS = 25      # most points for having no open items that nobody has answered
+Lower waiting time = higher score; higher retention = higher score.
+"""
+
+from typing import Optional
 
 
-# Works out the four parts of the score.
-# In: items. Out: dictionary with response, review, newcomer and unanswered points.
-def health_parts(items):
-    response = sliding_points(median_first_response(items)["median_hours"],
-                              RESPONSE_FULL_HOURS, RESPONSE_ZERO_HOURS, RESPONSE_POINTS)
-    review = sliding_points(median_review_wait(items)["median_hours"],
-                            REVIEW_FULL_HOURS, REVIEW_ZERO_HOURS, REVIEW_POINTS)
-    newcomer = share_points(newcomer_long_wait_share(items, NEWCOMER_WAIT_HOURS), NEWCOMER_POINTS)
-    unanswered = share_points(unanswered_share(items), UNANSWERED_POINTS)
-    return {"response": response, "review": review, "newcomer": newcomer, "unanswered": unanswered}
+# ──────────────────────────────────────────────
+# Per-metric sub-scores (each 0–100)
+# ──────────────────────────────────────────────
+
+def _score_time(minutes: Optional[float], excellent: float, terrible: float) -> float:
+    """
+    Linear interpolation: excellent minutes → 100, terrible → 0.
+    Anything better than excellent caps at 100; worse than terrible → 0.
+    """
+    if minutes is None:
+        return 50.0   # no data: neutral
+    if minutes <= excellent:
+        return 100.0
+    if minutes >= terrible:
+        return 0.0
+    return round(100.0 * (terrible - minutes) / (terrible - excellent), 1)
 
 
-# The main function: adds up the four parts. In: items. Out: a score from 0 to 100.
-def health_score(items):
-    parts = health_parts(items)
-    total = parts["response"] + parts["review"] + parts["newcomer"] + parts["unanswered"]
-    return round(total, 1)
+def score_first_response(median_min: Optional[float]) -> float:
+    """100 at ≤60 min, 0 at ≥10 080 min (7 days)."""
+    return _score_time(median_min, excellent=60, terrible=10_080)
 
 
-# Prints one part of the score. In: label, points, most points. Out: nothing.
-def print_part(label, points, max_points):
-    print("  " + label + str(round(points, 1)) + " / " + str(max_points))
+def score_pr_review(median_min: Optional[float]) -> float:
+    """100 at ≤120 min (2 h), 0 at ≥20 160 min (14 days)."""
+    return _score_time(median_min, excellent=120, terrible=20_160)
 
 
-# Loads cache.json and prints the four parts and the total.
-def main():
-    if not cache_exists():
-        print("No cache.json yet. Run python3 fetch.py first.")
-        sys.exit(1)
-    items = load_cache()["items"]
-    parts = health_parts(items)
-    print_part("Response part:   ", parts["response"], RESPONSE_POINTS)
-    print_part("Review part:     ", parts["review"], REVIEW_POINTS)
-    print_part("Newcomer part:   ", parts["newcomer"], NEWCOMER_POINTS)
-    print_part("Unanswered part: ", parts["unanswered"], UNANSWERED_POINTS)
-    print("Health score: " + str(health_score(items)) + " / 100")
+def score_newcomer_retention(retention_pct: Optional[float]) -> float:
+    """Retention % maps directly to 0–100."""
+    if retention_pct is None:
+        return 50.0
+    return min(100.0, max(0.0, round(retention_pct, 1)))
+
+
+def score_funnel(funnel: dict) -> float:
+    """
+    Funnel score = (stage2_pr + stage3_repeat) / total_contributors * 100.
+    Rewards repos where issue-raisers go on to submit PRs and come back.
+    """
+    total = funnel.get("total_contributors", 0)
+    if not total:
+        return 50.0
+    advanced = funnel.get("stage2_pr", 0) + funnel.get("stage3_repeat", 0)
+    # cap at total to avoid > 100 (stage3 people are also in stage2)
+    raw = min(advanced, total) / total * 100
+    return round(raw, 1)
+
+
+# ──────────────────────────────────────────────
+# Composite score
+# ──────────────────────────────────────────────
+
+WEIGHTS = {
+    "first_response": 0.30,
+    "pr_review":      0.30,
+    "retention":      0.25,
+    "funnel":         0.15,
+}
+
+
+def health_score(metrics: dict) -> dict:
+    """
+    Takes the output of metrics.all_metrics() and returns:
+      score       – 0-100 composite
+      grade       – A / B / C / D / F
+      breakdown   – per-metric sub-scores with weights
+    """
+    sub = {
+        "first_response": score_first_response(metrics.get("median_first_response_min")),
+        "pr_review":      score_pr_review(metrics.get("median_pr_review_wait_min")),
+        "retention":      score_newcomer_retention(
+                              (metrics.get("newcomer_retention") or {}).get("retention_pct")),
+        "funnel":         score_funnel(metrics.get("contributor_funnel") or {}),
+    }
+
+    composite = sum(sub[k] * WEIGHTS[k] for k in sub)
+    composite = round(composite, 1)
+
+    if composite >= 80:
+        grade = "A"
+    elif composite >= 65:
+        grade = "B"
+    elif composite >= 50:
+        grade = "C"
+    elif composite >= 35:
+        grade = "D"
+    else:
+        grade = "F"
+
+    return {
+        "score":     composite,
+        "grade":     grade,
+        "breakdown": {
+            k: {"sub_score": sub[k], "weight": WEIGHTS[k]}
+            for k in sub
+        },
+    }
 
 
 if __name__ == "__main__":
-    main()
+    import pprint
+    from metrics import all_metrics
+    m = all_metrics()
+    pprint.pprint(health_score(m))
