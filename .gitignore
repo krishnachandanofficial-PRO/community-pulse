@@ -1,0 +1,5 @@
+# Never commit the GitHub token
+.env
+# Downloaded data, can be re-created with: python3 fetch.py --refresh
+cache.json
+__pycache__/
